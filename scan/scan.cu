@@ -240,7 +240,7 @@ int find_repeats(int* device_input, int length, int* device_output) {
     
     // make mask 
     repeat_mask_kernel<<<blocks, THREADS_PER_BLOCK>>>(device_input, device_mask, length);
-    cudaMemcpy(prefix, device_mask, N * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(prefix, device_mask, N * sizeof(int), cudaMemcpyDeviceToDevice);
 
     // exclusive scan
     exclusive_scan(device_mask, N, prefix);
