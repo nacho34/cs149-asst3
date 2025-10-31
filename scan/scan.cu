@@ -182,6 +182,32 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
+__global__ void repeat_mask_kernel(int *arr, int *mask, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx == N - 1) {
+        mask[idx] = 0;
+    } else {
+        mask[idx] = (arr[idx] == arr[idx + 1]) ? 1 : 0;
+    }
+}
+
+__global__ void scatter_repeats_kernel(int *mask, int *prefix, int *output, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < N && mask[idx] == 1) {
+        output[prefix[idx]] = idx;
+    }
+}
+
+void print_cuda_int_array(int* array, int length) {
+    int *input = new int[length];
+    cudaMemcpy(input, array, length * sizeof(int), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < length; i++) {
+        printf("%d ", input[i]);
+    }
+    printf("\n");
+    delete[] input;
+}
 
 // find_repeats --
 //
@@ -202,10 +228,33 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    int N = nextPow2(length);
 
+    int* device_mask;
+    cudaMalloc((void **)&device_mask, N * sizeof(int));
+
+    int* prefix;
+    cudaMalloc((void **)&prefix, N * sizeof(int));
     
+    int blocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    
+    // make mask 
+    repeat_mask_kernel<<<blocks, THREADS_PER_BLOCK>>>(device_input, device_mask, length);
+    cudaMemcpy(prefix, device_mask, N * sizeof(int), cudaMemcpyHostToDevice);
 
-    return 0; 
+    // exclusive scan
+    exclusive_scan(device_mask, N, prefix);
+
+    // scatter repeated indices
+    scatter_repeats_kernel<<<blocks, THREADS_PER_BLOCK>>>(device_mask, prefix, device_output, length);
+
+    int numPairs;
+    cudaMemcpy(&numPairs, prefix + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+
+    cudaFree(device_mask);
+    cudaFree(prefix);
+
+    return numPairs;
 }
 
 
