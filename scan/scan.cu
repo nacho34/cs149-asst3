@@ -27,6 +27,30 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+__global__ void scan_upsweep_kernel(int *arr, int two_d, int N) {
+    int threadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    int two_dplus1 = two_d * 2;
+    int i = threadIndex * two_dplus1;
+
+    // prevent threads in the last block running off the end of the array
+    if (i+two_dplus1-1 < N) {
+        arr[i+two_dplus1-1] += arr[i+two_d-1];
+    }
+}
+
+__global__ void scan_downsweep_kernel(int *arr, int two_d, int N) {
+    int threadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    int two_dplus1 = two_d * 2;
+    int i = threadIndex * two_dplus1;
+
+    // prevent threads in the last block running off the end of the array
+    if (i+two_dplus1-1 < N) {
+        int t = arr[i+two_d-1];
+        arr[i+two_d-1] = arr[i+two_dplus1-1];
+        arr[i+two_dplus1-1] += t;
+    }
+}
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -54,7 +78,25 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
+    // upsweep phase
+    for (int two_d = 1; two_d <= N/2; two_d*=2) {
+        int two_dplus1 = two_d*2;
+        int num_threads = (N % two_dplus1 == 0) ? N / two_dplus1 : N / two_dplus1 + 1;
+        int blocks = (num_threads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        scan_upsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, N);
+    }
 
+    // zero out last number
+    int zero = 0;
+    cudaMemcpy(result+N-1, &zero, sizeof(int), cudaMemcpyHostToDevice);
+
+    // downsweep phase
+    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = two_d*2;
+        int num_threads = (N % two_dplus1 == 0) ? N / two_dplus1 : N / two_dplus1 + 1;
+        int blocks = (num_threads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        scan_downsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, N);
+    }
 }
 
 
@@ -160,6 +202,8 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+
+    
 
     return 0; 
 }
