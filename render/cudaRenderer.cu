@@ -14,6 +14,8 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+#include "CycleTimer.h"
+#include "circleBoxTest.cu_inl"
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -325,6 +327,8 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
+
+
     float rad = cuConstRendererParams.radius[circleIndex];;
     float maxDist = rad * rad;
 
@@ -449,8 +453,10 @@ __global__ void kernelRenderCirclesCorrect() {
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
     
     int numCircles = cuConstRendererParams.numCircles;
+    
     for (int circle_idx = 0; circle_idx < numCircles; circle_idx++) {
         float3 p = *(float3*)(&cuConstRendererParams.position[circle_idx * 3]);
+
         shadePixel(circle_idx, pixelCenterNorm, p, imgPtr);
     }
 }
@@ -459,10 +465,15 @@ __global__ void kernelRenderCirclesFast() {
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
+    int boxL = blockIdx.x * blockDim.x;
+    int boxR = boxL + blockDim.x;
+    int boxT = blockIdx.y * blockDim.y;
+    int boxB = boxT + blockDim.y;
+
     // iterate over pixels interleaved
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
-
+    
     if (pixelX >= imageWidth || pixelY >= imageHeight)
         return;
 
@@ -475,8 +486,12 @@ __global__ void kernelRenderCirclesFast() {
     
     int numCircles = cuConstRendererParams.numCircles;
     for (int circle_idx = 0; circle_idx < numCircles; circle_idx++) {
+        float rad = cuConstRendererParams.radius[circle_idx];
         float3 p = *(float3*)(&cuConstRendererParams.position[circle_idx * 3]);
-        shadePixel(circle_idx, pixelCenterNorm, p, imgPtr);
+        // shadePixel(circle_idx, pixelCenterNorm, p, imgPtr);
+        if (circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB)) {
+            shadePixel(circle_idx, pixelCenterNorm, p, imgPtr);
+        }
     }
 }
 
@@ -696,10 +711,18 @@ CudaRenderer::render() {
     // kernelRenderCircles<<<gridDim, blockDim>>>();
 
     // NAIVE CORRECT IMPL.
+    // double start_render = CycleTimer::currentSeconds();
     // dim3 blockDim(256, 1);
     // int totalPixels = image->height * image->width;
     // dim3 gridDim((totalPixels + blockDim.x - 1) / blockDim.x);
-    // kernelRenderCirclesCorrect<<<gridDim, blockDim>>>();
+    // if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
+    //     kernelRenderCirclesCorrectSnowflake<<<gridDim, blockDim>>>();
+    // } else {
+    //     kernelRenderCirclesCorrectNotSnowflake<<<gridDim, blockDim>>>();
+    // }
+    // double end_render = CycleTimer::currentSeconds();
+
+    // printf("%f", end_render - start_render);
 
     // FAST IMPL.
     dim3 blockDim(16, 16, 1);
