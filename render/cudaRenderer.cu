@@ -455,6 +455,31 @@ __global__ void kernelRenderCirclesCorrect() {
     }
 }
 
+__global__ void kernelRenderCirclesFast() {
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // iterate over pixels interleaved
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    if (pixelX >= imageWidth || pixelY >= imageHeight)
+        return;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                        invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    
+    int numCircles = cuConstRendererParams.numCircles;
+    for (int circle_idx = 0; circle_idx < numCircles; circle_idx++) {
+        float3 p = *(float3*)(&cuConstRendererParams.position[circle_idx * 3]);
+        shadePixel(circle_idx, pixelCenterNorm, p, imgPtr);
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -664,14 +689,24 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
+    // DEFAULT INCORRECT IMPL.
     // 256 threads per block is a healthy number
     // dim3 blockDim(256, 1);
     // dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
     // kernelRenderCircles<<<gridDim, blockDim>>>();
 
-    dim3 blockDim(256, 1);
-    int totalPixels = image->height * image->width;
-    dim3 gridDim((totalPixels + blockDim.x - 1) / blockDim.x);
-    kernelRenderCirclesCorrect<<<gridDim, blockDim>>>();
+    // NAIVE CORRECT IMPL.
+    // dim3 blockDim(256, 1);
+    // int totalPixels = image->height * image->width;
+    // dim3 gridDim((totalPixels + blockDim.x - 1) / blockDim.x);
+    // kernelRenderCirclesCorrect<<<gridDim, blockDim>>>();
+
+    // FAST IMPL.
+    dim3 blockDim(16, 16, 1);
+    int gridDimX = (image->width + blockDim.x - 1) / blockDim.x;
+    int gridDimY = (image->height + blockDim.y - 1) / blockDim.y;
+    dim3 gridDim(gridDimX, gridDimY);
+    kernelRenderCirclesFast<<<gridDim, blockDim>>>();
+
     cudaDeviceSynchronize();
 }
