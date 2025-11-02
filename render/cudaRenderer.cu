@@ -59,6 +59,8 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
 
+#define SPATIAL_BIN_DIM = 16; // pixel width/height of square spatial bins used for acceleration
+#define BASE_BIN_INTERSECTIONS_ARRAY_DIM = 256; // initial size of array storing bin-circle overlaps
 
 // kernelClearImageSnowflake -- (CUDA device code)
 //
@@ -404,7 +406,7 @@ __global__ void kernelRenderCircles() {
 
     // compute the bounding box of the circle. The bound is in integer
     // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageWidth  = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
     short minX = static_cast<short>(imageWidth * (p.x - rad));
     short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
@@ -435,7 +437,6 @@ __global__ void kernelRenderCircles() {
 __global__ void kernelRenderCirclesCorrect() {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // iterate over pixels interleaved
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
 
@@ -465,11 +466,6 @@ __global__ void kernelRenderCirclesFast() {
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
-    int boxL = blockIdx.x * blockDim.x;
-    int boxR = boxL + blockDim.x;
-    int boxT = blockIdx.y * blockDim.y;
-    int boxB = boxT + blockDim.y;
-
     // iterate over pixels interleaved
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
@@ -482,16 +478,180 @@ __global__ void kernelRenderCirclesFast() {
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                         invHeight * (static_cast<float>(pixelY) + 0.5f));
 
+    float boxL = invWidth * static_cast<float>(blockIdx.x * blockDim.x);
+    float boxR = invWidth * static_cast<float>(blockIdx.x * blockDim.x + blockDim.x);
+    float boxB = invHeight * static_cast<float>(blockIdx.y * blockDim.y);
+    float boxT = invHeight * static_cast<float>(blockIdx.y * blockDim.y + blockDim.y);
+
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
     
     int numCircles = cuConstRendererParams.numCircles;
     for (int circle_idx = 0; circle_idx < numCircles; circle_idx++) {
         float rad = cuConstRendererParams.radius[circle_idx];
         float3 p = *(float3*)(&cuConstRendererParams.position[circle_idx * 3]);
-        // shadePixel(circle_idx, pixelCenterNorm, p, imgPtr);
         if (circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB)) {
             shadePixel(circle_idx, pixelCenterNorm, p, imgPtr);
         }
+    }
+}
+
+// store count of how many circles intersect with each bin
+__global__ void kernelCountIntersections(int* binIntersectionCounts) {
+    int circle_idx = blockIdx.x * blockDim.x + threadIdx;
+
+    if (circle_idx > numCircles) {
+        return;
+    }
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    float3 p = *(float3*)(&cuConstRendererParams.position[circle_idx * 3]);
+    float rad = cuConstRendererParams.radius[circle_idx];
+
+    int min_bin_x = (int) ((p.x - rad) * (imageWidth)) / SPATIAL_BIN_DIM;
+    int max_bin_x = (int) ((p.x + rad) * (imageWidth)) / SPATIAL_BIN_DIM;
+    int min_bin_y = (int) ((p.y - rad) * (imageHeight)) / SPATIAL_BIN_DIM;
+    int max_bin_y = (int) ((p.y + rad) * (imageHeight)) / SPATIAL_BIN_DIM;
+
+    min_bin_x = (int) clamp(min_bin_x, 0., numBinsX);
+    max_bin_x = (int) clamp(max_bin_x, 0., numBinsX);
+    min_bin_y = (int) clamp(min_bin_y, 0., numBinsY);
+    max_bin_y = (int) clamp(max_bin_y, 0., numBinsY);
+
+    // TODO: could optimize this to only put the circle in bins it definitely overlaps with... rn it's conservative
+    for (int bin_x = min_bin_x; bin_x < max_bin_x; bin_x++) {
+        for (int bin_y = min_bin_y; bin_y < max_bin_y; bin_y++) {
+            binIdx = binY * numBinsX + binX;
+            atomicAdd(&binCircleIntersectionCounts[binIdx], 1);
+        }
+    }
+}
+
+// helper function to round an integer up to the next power of 2
+static inline int nextPow2(int n) {
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
+
+__global__ void scan_upsweep_kernel(int *arr, int two_d, int N) {
+    int threadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    int two_dplus1 = two_d * 2;
+    int i = threadIndex * two_dplus1;
+
+    // prevent threads in the last block running off the end of the array
+    if (i+two_dplus1-1 < N) {
+        arr[i+two_dplus1-1] += arr[i+two_d-1];
+    }
+}
+
+__global__ void scan_downsweep_kernel(int *arr, int two_d, int N) {
+    int threadIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    int two_dplus1 = two_d * 2;
+    int i = threadIndex * two_dplus1;
+
+    // prevent threads in the last block running off the end of the array
+    if (i+two_dplus1-1 < N) {
+        int t = arr[i+two_d-1];
+        arr[i+two_d-1] = arr[i+two_dplus1-1];
+        arr[i+two_dplus1-1] += t;
+    }
+}
+
+// exclusive_scan --
+//
+// in place exclusive scan on global memory array `input`,
+// with results placed in global memory `result`. Assumes N is a power of 2.
+void CudaRenderer::exclusiveScan(int N, int* result, int threads_per_block)
+{
+    // upsweep phase
+    for (int two_d = 1; two_d <= N/2; two_d*=2) {
+        int two_dplus1 = two_d*2;
+        int num_threads = (N % two_dplus1 == 0) ? N / two_dplus1 : N / two_dplus1 + 1;
+        int blocks = (num_threads + threads_per_block - 1) / threads_per_block;
+        scan_upsweep_kernel<<<blocks, threads_per_block>>>(result, two_d, N);
+    }
+
+    // zero out last number
+    int zero = 0;
+    cudaMemcpy(result+N-1, &zero, sizeof(int), cudaMemcpyHostToDevice);
+
+    // downsweep phase
+    for (int two_d = N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = two_d*2;
+        int num_threads = (N % two_dplus1 == 0) ? N / two_dplus1 : N / two_dplus1 + 1;
+        int blocks = (num_threads + threads_per_block - 1) / threads_per_block;
+        scan_downsweep_kernel<<<blocks, threads_per_block>>>(result, two_d, N);
+    }
+}
+
+// put the circle-bin intersection pairs into a flattened array
+__global__ void kernelStoreIntersections(int* binIntersectionCounts, int* binIntersectionSums, int* binCircleIntersections) {
+    int circle_idx = blockIdx.x * blockDim.x + threadIdx;
+
+    if (circle_idx > numCircles) {
+        return;
+    }
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    float3 p = *(float3*)(&cuConstRendererParams.position[circle_idx * 3]);
+    float rad = cuConstRendererParams.radius[circle_idx];
+
+    int min_bin_x = (int) ((p.x - rad) * (imageWidth)) / SPATIAL_BIN_DIM;
+    int max_bin_x = (int) ((p.x + rad) * (imageWidth)) / SPATIAL_BIN_DIM;
+    int min_bin_y = (int) ((p.y - rad) * (imageHeight)) / SPATIAL_BIN_DIM;
+    int max_bin_y = (int) ((p.y + rad) * (imageHeight)) / SPATIAL_BIN_DIM;
+
+    min_bin_x = (int) clamp(min_bin_x, 0., imageWidth);
+    max_bin_x = (int) clamp(max_bin_x, 0., imageHeight);
+    min_bin_y = (int) clamp(min_bin_y, 0., imageWidth);
+    max_bin_y = (int) clamp(max_bin_y, 0., imageHeight);
+
+    // TODO: could optimize this to only put the circle in bins it definitely overlaps with... rn it's conservative
+    for (int bin_x = min_bin_x; bin_x < max_bin_x; bin_x++) {
+        for (int bin_y = min_bin_y; bin_y < max_bin_y; bin_y++) {
+            binIdx = binY * numBinsX + binX;
+            int end_of_bin_offset = atomicAdd(binIntersectionCounts[binIdx], -1);
+            binCircleIntersections[binIntersectionSums[binIdx] + end_of_bin_offset - 1] = circle_idx;
+        }
+    }
+}
+
+// for each pixel, based on the bin it's in, just shade the circles in that bin
+__global__ void kernelRenderBins(int* binIntersectionCounts, int* binIntersectionSums, int* binCircleIntersections) {
+    int binX = blockIdx.x;
+    int binY = blockIdx.y;
+    int binIdx = binY * numBinsX + binX;
+    int pixelX = binX * blockDim.x + threadIdx.x;
+    int pixelY = binY * blockDim.y + threadIdx.y;
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    if (pixelX >= imageWidth || pixelY >= imageHeight)
+        return;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                        invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+
+    // shade all the circles that are in the bin for this pixel
+    for (int i = binIntersectionSums[binIdx]; i < binCircleIntersectionSums[binIdx] + binIntersectionCounts[binIdx]; i++) {
+        int circle_idx = binCircleIntersections[i];
+        float rad = cuConstRendererParams.radius[circle_idx];
+        float3 p = *(float3*)(&cuConstRendererParams.position[circle_idx * 3]);
+        shadePixel(circle_idx, pixelCenterNorm, p, imgPtr);
     }
 }
 
@@ -506,6 +666,15 @@ CudaRenderer::CudaRenderer() {
     velocity = NULL;
     color = NULL;
     radius = NULL;
+
+    binIntersectionCounts = NULL;
+    binIntersectionCountsSize = 0;
+    binIntersectionSums = NULL;
+    binCircleIntersections = NULL;
+    binCircleIntersectionsSize = 0;
+    numBinsX = 0;
+    numBinsY = 0;
+    numBins = 0;
 
     cudaDevicePosition = NULL;
     cudaDeviceVelocity = NULL;
@@ -534,6 +703,10 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
     }
+
+    cudaFree(binIntersectionCounts);
+    cudaFree(binIntersectionSums);
+    cudaFree(binCircleIntersections);
 }
 
 const Image*
@@ -643,6 +816,16 @@ CudaRenderer::setup() {
 
     cudaMemcpyToSymbol(cuConstColorRamp, lookupTable, sizeof(float) * 3 * COLOR_MAP_SIZE);
 
+    numBinsX = (image->width + SPATIAL_BIN_DIM - 1) / SPATIAL_BIN_DIM;
+    numBinsY = (image->height + SPATIAL_BIN_DIM - 1) / SPATIAL_BIN_DIM;
+    numBins = numBinsX * numBinsY;
+
+    binIntersectionCountsSize = nextPow2(numBins); // need pow of 2 for scan to work
+    cudaMalloc(binIntersectionCounts, sizeof(int) * binIntersectionCountsSize); 
+    cudaMemset(binIntersectionCounts, 0, sizeof(int) * binIntersectionCountsSize);
+    cudaMalloc(binIntersectionSums, sizeof(int) * binIntersectionCountsSize); 
+    cudaMalloc(binCircleIntersections, sizeof(int) * BASE_BIN_INTERSECTIONS_ARRAY_DIM); // may be dynamically resized depending on intersection counts
+    binCircleIntersectionsSize = BASE_BIN_INTERSECTIONS_ARRAY_DIM;
 }
 
 // allocOutputImage --
@@ -725,11 +908,51 @@ CudaRenderer::render() {
     // printf("%f", end_render - start_render);
 
     // FAST IMPL.
-    dim3 blockDim(16, 16, 1);
+    // dim3 blockDim(16, 16, 1);
+    // int gridDimX = (image->width + blockDim.x - 1) / blockDim.x;
+    // int gridDimY = (image->height + blockDim.y - 1) / blockDim.y;
+    // dim3 gridDim(gridDimX, gridDimY);
+    // kernelRenderCirclesFast<<<gridDim, blockDim>>>();
+
+    // ACCELERATED IMPL.
+    dim3 blockDim(256, 1);
+    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+
+    // zero out arrays
+    cudaMemset(binIntersectionCounts, 0, sizeof(int) * binIntersectionCountsSize);
+    cudaMemset(binIntersectionSums, 0, sizeof(int) * binIntersectionCountsSize);
+    cudaMemset(binCircleIntersections, 0, sizeof(int) * binCircleIntersectionsSize);
+
+    // for each circle, mark bins that it overlaps with
+    kernelCountIntersections<<<gridDim, blockDim>>>(binIntersectionCounts);
+    cudaDeviceSynchronize();
+
+    // prefix sum so that we can index into intersections array
+    cudaMemcpy(binIntersectionCounts, binIntersectionSums, sizeof(int) * binIntersectionCountsSize, cudaMemcpyDeviceToDevice);
+    exclusiveScan(binIntersectionCountsSize, binIntersectionSums, 256);
+    cudaDeviceSynchronize();
+
+    // get total intersection count
+    int totalBinIntersections;
+    cudaMemcpy(&totalBinIntersections, binIntersectionSums + binIntersectionCountsSize - 1, sizeof(int), cudaMemcpyDeviceToHost);
+
+    // resize intersections array if necessary
+    if (totalBinIntersections > binCircleIntersectionsSize) {
+        binCircleIntersectionsSize = totalBinIntersections * 1.5;
+        cudaFree(binCircleIntersections);
+        cudaMalloc(binCircleIntersections, binCircleIntersectionsSize * sizeof(int));
+    }
+
+    // fill array with a flattened representation. for each block, stores which circles intersect with it
+    dim3 gridDim((totalBinIntersections + blockDim.x - 1) / blockDim.x);
+    kernelStoreIntersections<<<gridDim, blockDim>>>(binIntersectionCounts, binIntersectionSums, binCircleIntersections);
+    cudaDeviceSynchronize();
+
+    // render all the bins, 1 bin per block
+    dim3 blockDim(SPATIAL_BIN_DIM, SPATIAL_BIN_DIM, 1);
     int gridDimX = (image->width + blockDim.x - 1) / blockDim.x;
     int gridDimY = (image->height + blockDim.y - 1) / blockDim.y;
     dim3 gridDim(gridDimX, gridDimY);
-    kernelRenderCirclesFast<<<gridDim, blockDim>>>();
-
+    kernelRenderBins<<<gridDim, blockDim>>>(binIntersectionCounts, binIntersectionSums, binCircleIntersections);
     cudaDeviceSynchronize();
 }

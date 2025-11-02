@@ -14,6 +14,15 @@ class CudaRenderer : public CircleRenderer {
   float* color;
   float* radius;
 
+  int* binIntersectionCounts;
+  int binIntersectionCountsSize;
+  int* binIntersectionSums;
+  int* binCircleIntersections;
+  int binCircleIntersectionsSize;
+  int numBinsX;
+  int numBinsY;
+  int numBins;
+
   float* cudaDevicePosition;
   float* cudaDeviceVelocity;
   float* cudaDeviceColor;
@@ -27,6 +36,8 @@ class CudaRenderer : public CircleRenderer {
   const Image* getImage();
 
   void setup();
+
+  void exclusiveScan(int N, int* result, int threads_per_block);
 
   void loadScene(SceneName name, int seed = 0);
 
