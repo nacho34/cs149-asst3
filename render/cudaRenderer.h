@@ -15,6 +15,7 @@ class CudaRenderer : public CircleRenderer {
   float* radius;
 
   int* binIntersectionCounts;
+  int* binIntersectionCountsCopy;
   int binIntersectionCountsSize;
   int* binIntersectionSums;
   int* binCircleIntersections;
